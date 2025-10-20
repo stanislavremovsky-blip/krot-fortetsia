@@ -1,15 +1,20 @@
 import os
+import logging
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from google import genai
 from google.genai import types
 
 # =======================================================================
-# !!! ВАШІ КЛЮЧІ ВЖЕ ІНТЕГРОВАНІ В КОД !!!
+# !!! КЛЮЧІ БУДУТЬ ЗАВАНТАЖЕНІ ЗІ ЗМІННИХ СЕРЕДОВИЩА RENDER !!!
 # =======================================================================
-TELEGRAM_BOT_TOKEN = "8396649200:AAG6ir840thfaaNHPZtVz6YbmTMCYWn48YU"
-GEMINI_API_KEY = "AIzaSyDgCEiK94dEB79DL-BjhLQv4MmMS609TDs"
-# =======================================================================
+# Це гарантує, що ключі будуть доступні, оскільки вони вимагаються Webhooks
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+# Налаштування логування для діагностики
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------------
 # ВАШ ФІНАЛЬНИЙ МАЙСТЕР-ПРОМПТ (Системна інструкція для Майстра Гри)
@@ -68,57 +73,59 @@ SYSTEM_PROMPT = """
 # -----------------------------------------------------------------------
 
 # Ініціалізація клієнта Gemini
-client = genai.Client(api_key=GEMINI_API_KEY)
-# Використовуємо словник для збереження історії чату (контексту) для кожного користувача
+# os.environ.get автоматично шукає ключ GEMINI_API_KEY 
+client = genai.Client() 
 user_chats = {} 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробляє команду /start і ініціалізує нову гру."""
     chat_id = update.effective_chat.id
     
-    # Створюємо нову сесію чату з моделлю і додаємо наш системний промпт
-    chat = client.chats.create(
-        model="gemini-2.5-flash", # Швидка та ефективна модель для чату
-        system_instruction=SYSTEM_PROMPT
-    )
-    user_chats[chat_id] = chat
-    
-    # Надсилаємо перший запит, щоб модель згенерувала локацію та список підозрюваних
-    initial_response = chat.send_message("СТАРТ ГРИ. Сформуй внутрішні змінні і виведи початковий опис згідно з Правилом 7.")
-    
-    await update.message.reply_text(initial_response.text)
+    # Створення нової сесії чату з моделлю
+    try:
+        chat = client.chats.create(
+            model="gemini-2.5-flash",
+            system_instruction=SYSTEM_PROMPT
+        )
+        user_chats[chat_id] = chat
+        
+        initial_response = chat.send_message("СТАРТ ГРИ. Сформуй внутрішні змінні і виведи початковий опис згідно з Правилом 7.")
+        await update.message.reply_text(initial_response.text)
+        logger.info(f"New game started for chat_id: {chat_id}")
+
+    except Exception as e:
+        logger.error(f"Error starting chat: {e}")
+        await update.message.reply_text(f"Виникла помилка при запуску гри: {e}. Перевірте ваші ключі API.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обробляє всі повідомлення гравця в середині гри."""
     chat_id = update.effective_chat.id
     user_message = update.message.text
     
-    # Перевіряємо, чи існує активна гра для цього користувача
     if chat_id not in user_chats:
         await update.message.reply_text("Будь ласка, почніть нову гру командою /start.")
         return
 
     chat = user_chats[chat_id]
     
-    # Відправляємо повідомлення гравця в поточний чат Gemini
     try:
         response = chat.send_message(user_message)
         await update.message.reply_text(response.text)
         
         # Перевірка на завершення гри
         if "Перемога" in response.text or "Програш" in response.text:
-            del user_chats[chat_id] # Видаляємо чат зі списку активних
+            del user_chats[chat_id]
             await update.message.reply_text("Гра завершена. Почніть нову справу за допомогою /start.")
             
     except Exception as e:
-        # У разі помилки API (наприклад, закінчився ліміт), сповіщаємо користувача
+        logger.error(f"Error handling message: {e}")
         await update.message.reply_text(f"Виникла технічна помилка: {e}. Спробуйте /start знову.")
 
 def main() -> None:
-    """Запускає бота."""
-    # Перевірка наявності ключів (хоча ми їх вже інтегрували)
-    if not TELEGRAM_BOT_TOKEN or not GEMINI_API_KEY:
-        print("ПОМИЛКА: Будь ласка, заповніть TELEGRAM_BOT_TOKEN та GEMINI_API_KEY у коді.")
+    """Запускає бота в режимі Webhooks для Render."""
+    
+    if not TELEGRAM_BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN не знайдено.")
         return
 
     # Ініціалізація програми Telegram
@@ -127,10 +134,30 @@ def main() -> None:
     # Реєстрація обробників
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # -----------------------------------------------------------
+    # КРИТИЧНО: Налаштування Webhooks для Render
+    # -----------------------------------------------------------
+    
+    # Render надає порт та зовнішній URL через змінні середовища
+    PORT = int(os.environ.get('PORT', 8080))
+    WEBHOOK_URL = os.environ.get('RENDER_EXTERNAL_URL') 
 
-    # Запуск бота (Polling)
-    print("Бот запущено. Натисніть Ctrl+C, щоб зупинити.")
-    application.run_polling(poll_interval=3)
+    if WEBHOOK_URL:
+        logger.info(f"Starting Webhook mode on port {PORT}")
+        
+        # Налаштування параметрів вебхука
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=TELEGRAM_BOT_TOKEN,
+            webhook_url=f"{WEBHOOK_URL}webhook/{TELEGRAM_BOT_TOKEN}", # Додано '/webhook/' для чистоти
+            # Примітка: application.run_webhook автоматично стартує сервер
+        )
+    else:
+        # Режим Polling (якщо запускається локально, наприклад, у Termux)
+        logger.warning("RENDER_EXTERNAL_URL не знайдено, запускаємо в режимі Polling (для тестування).")
+        application.run_polling(poll_interval=3)
 
 if __name__ == "__main__":
     main()
